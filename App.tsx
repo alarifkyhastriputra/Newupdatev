@@ -490,18 +490,20 @@ export default function App() {
   }, [selectedProfileId, users, currentUser]);
 
   if (authLoading) return (
-    <div className="flex items-center justify-center min-h-screen bg-white">
-      <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-black"></div>
+    <div className="flex flex-col items-center justify-center min-h-screen bg-white animate-fade-in">
+      <div className="relative">
+        <div className="absolute -inset-4 rounded-full bg-black/5 animate-ping" style={{ animationDuration: '2s' }}></div>
+        <div className="w-16 h-16 rounded-3xl bg-black flex items-center justify-center relative z-10 shadow-lg">
+          <i className="fas fa-circle-notch text-white text-2xl animate-spin"></i>
+        </div>
+      </div>
+      <p className="mt-6 text-[10px] font-black uppercase tracking-[0.4em] text-gray-400 animate-pulse">
+        CONNECTING...
+      </p>
     </div>
   );
 
   if (!currentUser) return <AuthScreen bannedMessage={bannedMessage} />;
-
-  if (loadingPosts) return (
-    <div className="flex items-center justify-center min-h-screen bg-white">
-      <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-black"></div>
-    </div>
-  );
 
   return (
     <div className="flex flex-col min-h-screen bg-white max-w-xl mx-auto border-x border-gray-100 shadow-sm relative overflow-hidden">
@@ -533,6 +535,7 @@ export default function App() {
             }}
             onDeletePost={deletePost}
             users={users}
+            isLoading={loadingPosts}
           />
         )}
         {currentView === View.REELS && (

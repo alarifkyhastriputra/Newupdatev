@@ -178,17 +178,26 @@ const PostCard: React.FC<PostCardProps> = ({
       </div>
 
       {(post.photoURL || post.videoURL) && (
-        <div className={`relative bg-black border-y border-black/5 overflow-hidden flex items-center justify-center ${post.isTakenDown ? 'opacity-30' : ''}`}>
+        <div className={`relative bg-black border-y border-black/5 overflow-hidden flex items-center justify-center min-h-[200px] ${post.isTakenDown ? 'opacity-30' : ''}`}>
           {post.photoURL && (
             <img 
               src={post.photoURL} 
               alt="Content" 
-              className="w-full h-auto max-h-[80vh] object-contain cursor-zoom-in" 
+              loading="eager"
+              fetchPriority="high"
+              className="w-full h-auto max-h-[80vh] object-contain cursor-zoom-in animate-fade-in" 
               onClick={() => setIsZoomed(true)}
             />
           )}
           {post.videoURL && (
-            <video src={post.videoURL} className="w-full h-auto max-h-[80vh] object-contain" controls={!post.isTakenDown} playsInline muted />
+            <video 
+              src={post.videoURL} 
+              preload="auto"
+              className="w-full h-auto max-h-[80vh] object-contain" 
+              controls={!post.isTakenDown} 
+              playsInline 
+              muted 
+            />
           )}
         </div>
       )}
