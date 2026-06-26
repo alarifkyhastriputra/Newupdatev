@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { User } from '../types.ts';
 import { useLanguage } from '../LanguageContext.tsx';
+import { db } from '../firebase.ts';
+import { ref, onValue, set, push, update } from 'firebase/database';
 
 export interface ActiveCall {
   id: string;
@@ -26,6 +28,14 @@ interface CallingOverlayProps {
   onEnd: () => void;
 }
 
+const iceServers = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' }
+  ]
+};
+
 const CallingOverlay: React.FC<CallingOverlayProps> = ({
   activeCall,
   currentUser,
@@ -39,8 +49,12 @@ const CallingOverlay: React.FC<CallingOverlayProps> = ({
   const [isMuted, setIsMuted] = useState(false);
   const [isCameraOff, setIsCameraOff] = useState(false);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  const [remoteState, setRemoteState] = useState<{ isMuted: boolean; isCameraOff: boolean } | null>(null);
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const peerConnection = useRef<RTCPeerConnection | null>(null);
 
   const isCaller = activeCall.callerId === currentUser.id;
   const isJoined = activeCall.activeParticipants?.[currentUser.id] === true;
@@ -58,11 +72,18 @@ const CallingOverlay: React.FC<CallingOverlayProps> = ({
     return () => clearInterval(timer);
   }, [activeCall.status]);
 
-  // Request Camera & Audio if Video Call and Joined/Connected
+  // Request Camera & Audio based on mediaType & status
   useEffect(() => {
-    if (activeCall.mediaType === 'video' && (activeCall.status === 'connected' || (isCaller && activeCall.status !== 'ended'))) {
-      navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+    let streamInstance: MediaStream | null = null;
+    const constraints = {
+      audio: true,
+      video: activeCall.mediaType === 'video'
+    };
+
+    if (activeCall.status === 'connected' || (isCaller && activeCall.status !== 'ended')) {
+      navigator.mediaDevices.getUserMedia(constraints)
         .then((stream) => {
+          streamInstance = stream;
           setLocalStream(stream);
           if (localVideoRef.current) {
             localVideoRef.current.srcObject = stream;
@@ -74,11 +95,149 @@ const CallingOverlay: React.FC<CallingOverlayProps> = ({
     }
 
     return () => {
-      if (localStream) {
-        localStream.getTracks().forEach(track => track.stop());
+      if (streamInstance) {
+        streamInstance.getTracks().forEach(track => track.stop());
       }
     };
-  }, [activeCall.mediaType, activeCall.status, isCaller]);
+  }, [activeCall.status, activeCall.mediaType, isCaller]);
+
+  // Sync state (muted / cameraOff) to Firebase for UI indicators
+  useEffect(() => {
+    if (activeCall.status === 'connected') {
+      const stateRef = ref(db, `calls/${activeCall.id}/participantsState/${currentUser.id}`);
+      set(stateRef, {
+        isMuted,
+        isCameraOff
+      });
+    }
+  }, [isMuted, isCameraOff, activeCall.status, activeCall.id, currentUser.id]);
+
+  // Read remote participant's state (mute / cameraOff)
+  useEffect(() => {
+    if (activeCall.status === 'connected') {
+      const targetId = isCaller ? activeCall.receiverId : activeCall.callerId;
+      if (targetId) {
+        const remoteStateRef = ref(db, `calls/${activeCall.id}/participantsState/${targetId}`);
+        const unsubscribe = onValue(remoteStateRef, (snapshot) => {
+          setRemoteState(snapshot.val());
+        });
+        return () => unsubscribe();
+      }
+    }
+  }, [activeCall.status, isCaller, activeCall.id, activeCall.receiverId, activeCall.callerId]);
+
+  // WebRTC Signal & Peer Connection Establishment
+  useEffect(() => {
+    if (activeCall.status !== 'connected' || !localStream) return;
+
+    const pc = new RTCPeerConnection(iceServers);
+    peerConnection.current = pc;
+
+    // Add local tracks to peer connection
+    localStream.getTracks().forEach((track) => {
+      pc.addTrack(track, localStream);
+    });
+
+    // Handle incoming track
+    pc.ontrack = (event) => {
+      if (event.streams && event.streams[0]) {
+        setRemoteStream(event.streams[0]);
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = event.streams[0];
+        }
+      }
+    };
+
+    // Gather ICE candidates and push them to database
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        const candidatePath = `calls/${activeCall.id}/signal/${isCaller ? 'callerCandidates' : 'receiverCandidates'}`;
+        const newCandidateRef = push(ref(db, candidatePath));
+        set(newCandidateRef, event.candidate.toJSON());
+      }
+    };
+
+    // Signaling references
+    const offerRef = ref(db, `calls/${activeCall.id}/signal/offer`);
+    const answerRef = ref(db, `calls/${activeCall.id}/signal/answer`);
+    const callerCandidatesRef = ref(db, `calls/${activeCall.id}/signal/callerCandidates`);
+    const receiverCandidatesRef = ref(db, `calls/${activeCall.id}/signal/receiverCandidates`);
+
+    let unsubscribeOffer: () => void = () => {};
+    let unsubscribeAnswer: () => void = () => {};
+    let unsubscribeCandidates: () => void = () => {};
+
+    if (isCaller) {
+      // 1. Create and send offer
+      pc.createOffer()
+        .then((offer) => pc.setLocalDescription(offer))
+        .then(() => {
+          set(offerRef, {
+            type: pc.localDescription?.type,
+            sdp: pc.localDescription?.sdp
+          });
+        })
+        .catch((err) => console.error("Error creating offer", err));
+
+      // 2. Listen for answer
+      unsubscribeAnswer = onValue(answerRef, (snapshot) => {
+        const answer = snapshot.val();
+        if (answer && pc.signalingState !== 'stable') {
+          pc.setRemoteDescription(new RTCSessionDescription(answer))
+            .catch((err) => console.error("Error setting remote description for answer", err));
+        }
+      });
+
+      // 3. Listen for receiver candidates
+      unsubscribeCandidates = onValue(receiverCandidatesRef, (snapshot) => {
+        const data = snapshot.val();
+        if (data) {
+          Object.values(data).forEach((candidateData: any) => {
+            pc.addIceCandidate(new RTCIceCandidate(candidateData))
+              .catch((err) => console.warn("Error adding ICE candidate", err));
+          });
+        }
+      });
+    } else {
+      // Receiver side
+      // 1. Listen for offer and create answer
+      unsubscribeOffer = onValue(offerRef, (snapshot) => {
+        const offer = snapshot.val();
+        if (offer && pc.signalingState !== 'have-local-offer') {
+          pc.setRemoteDescription(new RTCSessionDescription(offer))
+            .then(() => pc.createAnswer())
+            .then((answer) => pc.setLocalDescription(answer))
+            .then(() => {
+              set(answerRef, {
+                type: pc.localDescription?.type,
+                sdp: pc.localDescription?.sdp
+              });
+            })
+            .catch((err) => console.error("Error setting offer or creating answer", err));
+        }
+      });
+
+      // 2. Listen for caller candidates
+      unsubscribeCandidates = onValue(callerCandidatesRef, (snapshot) => {
+        const data = snapshot.val();
+        if (data) {
+          Object.values(data).forEach((candidateData: any) => {
+            pc.addIceCandidate(new RTCIceCandidate(candidateData))
+              .catch((err) => console.warn("Error adding ICE candidate", err));
+          });
+        }
+      });
+    }
+
+    return () => {
+      unsubscribeOffer();
+      unsubscribeAnswer();
+      unsubscribeCandidates();
+      pc.close();
+      peerConnection.current = null;
+      setRemoteStream(null);
+    };
+  }, [activeCall.status, localStream, isCaller, activeCall.id]);
 
   // Format calling duration
   const formatDuration = (seconds: number) => {
@@ -124,6 +283,78 @@ const CallingOverlay: React.FC<CallingOverlayProps> = ({
   return (
     <div className="fixed inset-0 z-[999] bg-zinc-950 text-white flex flex-col justify-between p-6 animate-fade-in select-none">
       
+      {/* Hidden / Background video/audio player to output remote stream audio */}
+      {showConnected && (
+        <video 
+          ref={remoteVideoRef} 
+          autoPlay 
+          playsInline 
+          className="hidden" 
+        />
+      )}
+
+      {/* Full-screen Background Video for Video Calls */}
+      {activeCall.mediaType === 'video' && showConnected && (
+        <div className="absolute inset-0 w-full h-full bg-black z-0">
+          {remoteStream && !(remoteState?.isCameraOff) ? (
+            <video 
+              ref={(el) => {
+                // Keep local video assigned to ref and update srcObject
+                if (el) el.srcObject = remoteStream;
+              }}
+              autoPlay 
+              playsInline 
+              className="w-full h-full object-cover"
+            />
+          ) : (
+            <div className="w-full h-full flex flex-col items-center justify-center space-y-4 bg-zinc-900">
+              <div className="w-24 h-24 rounded-full border-4 border-white/10 p-1 bg-zinc-800 relative">
+                <div className="absolute -inset-2 rounded-full bg-blue-500/10 animate-ping"></div>
+                {callPhoto ? (
+                  <img src={callPhoto} className="w-full h-full rounded-full object-cover" alt={callTitle} />
+                ) : (
+                  <div className="w-full h-full rounded-full bg-blue-600 flex items-center justify-center text-3xl font-black">
+                    {callTitle.substring(0, 1).toUpperCase()}
+                  </div>
+                )}
+              </div>
+              <p className="text-xs font-bold uppercase tracking-widest text-zinc-500">
+                {remoteState?.isCameraOff ? "Camera Dimatikan" : "Menghubungkan Kamera Teman..."}
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Floating Picture-in-Picture Local Stream for Video Calls */}
+      {activeCall.mediaType === 'video' && showConnected && (
+        <div className="absolute top-24 right-4 w-28 h-40 bg-zinc-900 rounded-2xl border border-white/20 shadow-2xl overflow-hidden z-20">
+          {!isCameraOff && localStream ? (
+            <video 
+              ref={localVideoRef} 
+              autoPlay 
+              playsInline 
+              muted 
+              className="w-full h-full object-cover scale-x-[-1]" 
+            />
+          ) : (
+            <div className="w-full h-full flex flex-col items-center justify-center bg-zinc-800">
+              <div className="w-10 h-10 rounded-full border border-white/10 overflow-hidden">
+                <img 
+                  src={currentUser.photoURL || `https://api.dicebear.com/7.x/initials/svg?seed=${currentUser.name}`} 
+                  className="w-full h-full object-cover" 
+                  alt={currentUser.name} 
+                />
+              </div>
+              <span className="text-[8px] font-bold text-zinc-500 mt-2">Camera Off</span>
+            </div>
+          )}
+          <div className="absolute bottom-2 left-2 bg-black/60 px-1.5 py-0.5 rounded text-[8px] font-bold uppercase tracking-wider">
+            You
+          </div>
+        </div>
+      )}
+
       {/* Top Bar Status / Header */}
       <div className="flex flex-col items-center mt-12 space-y-2 z-10">
         <span className="text-[10px] font-black uppercase tracking-[0.3em] text-blue-500 bg-blue-500/10 px-3 py-1 rounded-full border border-blue-500/20">
@@ -141,51 +372,10 @@ const CallingOverlay: React.FC<CallingOverlayProps> = ({
         )}
       </div>
 
-      {/* Main visual display area */}
+      {/* Main visual display area (Hidden or styled as overlay when Video call is active) */}
       <div className="flex-1 flex flex-col items-center justify-center relative my-6">
-        {activeCall.mediaType === 'video' && showConnected ? (
-          // Video call main interface
-          <div className="w-full max-w-sm aspect-[3/4] bg-zinc-900 rounded-3xl overflow-hidden border border-white/10 relative shadow-2xl flex items-center justify-center">
-            
-            {/* Main Video (Local webcam stream) */}
-            {!isCameraOff ? (
-              <video 
-                ref={localVideoRef} 
-                autoPlay 
-                playsInline 
-                muted 
-                className="absolute inset-0 w-full h-full object-cover scale-x-[-1]" 
-              />
-            ) : (
-              <div className="flex flex-col items-center space-y-4">
-                <div className="w-24 h-24 rounded-full border-2 border-white/20 p-1 bg-zinc-850">
-                  <img 
-                    src={currentUser.photoURL || `https://api.dicebear.com/7.x/initials/svg?seed=${currentUser.name}`} 
-                    className="w-full h-full rounded-full object-cover" 
-                    alt={currentUser.name} 
-                  />
-                </div>
-                <p className="text-xs font-semibold text-zinc-400">Camera Off</p>
-              </div>
-            )}
-
-            {/* Floating remote picture or details inside video box */}
-            <div className="absolute bottom-4 left-4 bg-black/60 backdrop-blur-md px-3 py-1.5 rounded-2xl flex items-center space-x-2 border border-white/5">
-              <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
-              <span className="text-[10px] font-black uppercase tracking-wider">{currentUser.name.split(' ')[0]} (You)</span>
-            </div>
-
-            {/* Remote Info in Video mode */}
-            <div className="absolute top-4 right-4 bg-black/60 backdrop-blur-md px-3 py-2 rounded-2xl flex items-center space-x-3 border border-white/5">
-              {callPhoto && (
-                <img src={callPhoto} className="w-6 h-6 rounded-full border border-white/20" alt="Remote" />
-              )}
-              <span className="text-xs font-bold">{callTitle.split(' ')[0]}</span>
-            </div>
-
-          </div>
-        ) : (
-          // Voice call or ringing interface
+        {!(activeCall.mediaType === 'video' && showConnected) && (
+          // Voice call interface
           <div className="flex flex-col items-center space-y-6 z-10">
             
             {/* Pulse rings background */}
